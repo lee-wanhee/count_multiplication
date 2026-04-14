@@ -6,38 +6,37 @@ Input: (x1, x2) in [-1M, +1M], Output: x1 * x2
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torch.utils.data import Dataset, DataLoader
 import numpy as np
 import json
 import os
-import math
 import argparse
-from pathlib import Path
+import time
 
 
 # ============================================================
-# Dataset
+# Data Generation (all on GPU, no DataLoader overhead)
 # ============================================================
 
-class MultiplicationDataset(Dataset):
-    """Generate random pairs and their product."""
-    def __init__(self, n_samples, value_range=1e6, seed=None):
-        if seed is not None:
-            rng = np.random.RandomState(seed)
-        else:
-            rng = np.random.RandomState()
-        self.x1 = rng.uniform(-value_range, value_range, n_samples).astype(np.float64)
-        self.x2 = rng.uniform(-value_range, value_range, n_samples).astype(np.float64)
-        self.y = self.x1 * self.x2
+def generate_data(n_samples, device, seed=None):
+    """Generate normalized multiplication data directly as GPU tensors."""
+    rng = np.random.RandomState(seed)
+    x1 = rng.uniform(-1, 1, n_samples).astype(np.float32)
+    x2 = rng.uniform(-1, 1, n_samples).astype(np.float32)
+    y = x1 * x2  # in [-1, 1]
 
-    def __len__(self):
-        return len(self.x1)
+    X = torch.tensor(np.stack([x1, x2], axis=1), device=device)  # (N, 2)
+    Y = torch.tensor(y.reshape(-1, 1), device=device)  # (N, 1)
+    return X, Y
 
-    def __getitem__(self, idx):
-        # Normalize: divide by 1e6 so inputs are in [-1, 1], output in [-1, 1]
-        x = torch.tensor([self.x1[idx] / 1e6, self.x2[idx] / 1e6], dtype=torch.float32)
-        y = torch.tensor([self.y[idx] / 1e12], dtype=torch.float32)  # product of two 1e6 numbers
-        return x, y
+
+def batch_iterator(X, Y, batch_size, shuffle=True):
+    """Yield batches from pre-loaded GPU tensors."""
+    n = X.shape[0]
+    if shuffle:
+        idx = torch.randperm(n, device=X.device)
+        X, Y = X[idx], Y[idx]
+    for i in range(0, n, batch_size):
+        yield X[i:i+batch_size], Y[i:i+batch_size]
 
 
 # ============================================================
@@ -96,9 +95,7 @@ class TransformerMultiplier(nn.Module):
     def __init__(self, d_model=64, nhead=4, num_layers=2, dim_feedforward=128):
         super().__init__()
         self.d_model = d_model
-        # Embed each scalar input to d_model dimensions
         self.input_proj = nn.Linear(1, d_model)
-        # Learnable positional embedding for 2 positions
         self.pos_embed = nn.Parameter(torch.randn(2, d_model) * 0.02)
         encoder_layer = nn.TransformerEncoderLayer(
             d_model=d_model, nhead=nhead, dim_feedforward=dim_feedforward,
@@ -113,12 +110,9 @@ class TransformerMultiplier(nn.Module):
 
     def forward(self, x):
         # x: (batch, 2)
-        b = x.shape[0]
-        # Reshape to (batch, 2, 1) then project
         tokens = self.input_proj(x.unsqueeze(-1))  # (batch, 2, d_model)
         tokens = tokens + self.pos_embed.unsqueeze(0)
         out = self.encoder(tokens)  # (batch, 2, d_model)
-        # Pool: mean of both tokens
         pooled = out.mean(dim=1)  # (batch, d_model)
         return self.output_proj(pooled)  # (batch, 1)
 
@@ -127,8 +121,7 @@ class TransformerMultiplier(nn.Module):
 # Training
 # ============================================================
 
-def train_model(model, train_loader, val_loader, epochs, lr, device, model_name):
-    model = model.to(device)
+def train_model(model, train_X, train_Y, val_X, val_Y, epochs, lr, batch_size, model_name):
     optimizer = optim.Adam(model.parameters(), lr=lr)
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
 
@@ -139,8 +132,7 @@ def train_model(model, train_loader, val_loader, epochs, lr, device, model_name)
         model.train()
         total_loss = 0
         n_batches = 0
-        for x, y in train_loader:
-            x, y = x.to(device), y.to(device)
+        for x, y in batch_iterator(train_X, train_Y, batch_size, shuffle=True):
             pred = model(x)
             loss = nn.functional.mse_loss(pred, y)
             optimizer.zero_grad()
@@ -153,24 +145,16 @@ def train_model(model, train_loader, val_loader, epochs, lr, device, model_name)
 
         # Validate
         model.eval()
-        val_loss = 0
-        val_rel_errors = []
-        n_val = 0
         with torch.no_grad():
-            for x, y in val_loader:
-                x, y = x.to(device), y.to(device)
-                pred = model(x)
-                val_loss += nn.functional.mse_loss(pred, y).item()
-                # Relative error (avoid div by zero)
-                abs_y = torch.abs(y)
-                mask = abs_y > 1e-20  # skip near-zero targets
-                if mask.any():
-                    rel_err = (torch.abs(pred[mask] - y[mask]) / abs_y[mask]).mean().item()
-                    val_rel_errors.append(rel_err)
-                n_val += 1
-
-        avg_val_loss = val_loss / n_val
-        avg_rel_error = np.mean(val_rel_errors) if val_rel_errors else float('inf')
+            val_pred = model(val_X)
+            avg_val_loss = nn.functional.mse_loss(val_pred, val_Y).item()
+            # Relative error
+            abs_y = torch.abs(val_Y)
+            mask = abs_y > 1e-10
+            if mask.any():
+                avg_rel_error = (torch.abs(val_pred[mask] - val_Y[mask]) / abs_y[mask]).mean().item()
+            else:
+                avg_rel_error = float('inf')
 
         history['train_loss'].append(avg_train_loss)
         history['val_loss'].append(avg_val_loss)
@@ -216,9 +200,9 @@ def get_experiments():
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--epochs', type=int, default=100)
-    parser.add_argument('--batch-size', type=int, default=1024)
-    parser.add_argument('--train-samples', type=int, default=500000)
-    parser.add_argument('--val-samples', type=int, default=50000)
+    parser.add_argument('--batch-size', type=int, default=4096)
+    parser.add_argument('--train-samples', type=int, default=100000)
+    parser.add_argument('--val-samples', type=int, default=10000)
     parser.add_argument('--device', type=str, default='cuda' if torch.cuda.is_available() else 'cpu')
     parser.add_argument('--output-dir', type=str, default='results')
     parser.add_argument('--filter', type=str, default=None, help='Only run experiments matching this substring')
@@ -231,11 +215,12 @@ def main():
     print(f"Epochs: {args.epochs}, Batch size: {args.batch_size}")
     print()
 
-    # Create datasets
-    train_ds = MultiplicationDataset(args.train_samples, seed=42)
-    val_ds = MultiplicationDataset(args.val_samples, seed=123)
-    train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True, num_workers=4)
-    val_loader = DataLoader(val_ds, batch_size=args.batch_size, shuffle=False, num_workers=4)
+    # Pre-load all data on GPU
+    print("Loading data to GPU...")
+    train_X, train_Y = generate_data(args.train_samples, args.device, seed=42)
+    val_X, val_Y = generate_data(args.val_samples, args.device, seed=123)
+    print(f"Data loaded. Train: {train_X.shape}, Val: {val_X.shape}")
+    print()
 
     experiments = get_experiments()
     if args.filter:
@@ -244,18 +229,25 @@ def main():
     all_results = {}
 
     for name, model, lr in experiments:
+        model = model.to(args.device)
         n_params = sum(p.numel() for p in model.parameters())
         print(f"\n{'='*60}")
         print(f"Training: {name} ({n_params:,} params)")
         print(f"{'='*60}")
 
-        history = train_model(model, train_loader, val_loader, args.epochs, lr, args.device, name)
+        t0 = time.time()
+        history = train_model(model, train_X, train_Y, val_X, val_Y,
+                              args.epochs, lr, args.batch_size, name)
+        elapsed = time.time() - t0
+
         all_results[name] = {
             'history': history,
             'n_params': n_params,
             'final_val_mse': history['val_loss'][-1],
             'final_val_rel_error': history['val_rel_error'][-1],
+            'training_time_sec': round(elapsed, 1),
         }
+        print(f"[{name}] Done in {elapsed:.1f}s | Final Val RelErr: {history['val_rel_error'][-1]:.6f}")
 
         # Save per-model results
         with open(os.path.join(args.output_dir, f'{name}.json'), 'w') as f:
@@ -269,11 +261,11 @@ def main():
     print(f"\n\n{'='*80}")
     print("SUMMARY")
     print(f"{'='*80}")
-    print(f"{'Model':<35} {'Params':>10} {'Val MSE':>12} {'Val RelErr':>12}")
+    print(f"{'Model':<35} {'Params':>10} {'Val MSE':>12} {'Val RelErr':>12} {'Time(s)':>8}")
     print("-" * 80)
     for name in sorted(all_results, key=lambda n: all_results[n]['final_val_mse']):
         r = all_results[name]
-        print(f"{name:<35} {r['n_params']:>10,} {r['final_val_mse']:>12.2e} {r['final_val_rel_error']:>12.6f}")
+        print(f"{name:<35} {r['n_params']:>10,} {r['final_val_mse']:>12.2e} {r['final_val_rel_error']:>12.6f} {r['training_time_sec']:>8.1f}")
 
 
 if __name__ == '__main__':
