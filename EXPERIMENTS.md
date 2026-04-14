@@ -102,6 +102,58 @@ With just 2 input tokens, the attention computes a 2x2 attention matrix. The QK^
 
 ---
 
+## Part 2: Multiplication Counting — Transformers as Graphics Engines
+
+### Motivation
+
+Transformers are increasingly used for novel view synthesis (NVS) — given a single image and a camera pose, render what the scene looks like from a new viewpoint. Classical graphics achieves this with exact equations involving specific multiplications (rotation matrices, projections, volume rendering). Can we count and compare the multiplications?
+
+### Key Distinction: Input-Input vs Weight-Input Multiplications
+
+Not all multiplications in a neural network are equal:
+
+| Type | Example | Can learn multiplication? |
+|------|---------|--------------------------|
+| **Weight × Input** | Linear layer: y = Wx + b | No — only linear combinations |
+| **Input × Input** | Attention: QK^T | Yes — bilinear, multiplicative |
+
+Our experiment proves this: MLPs with ReLU/GELU (only weight × input muls) plateau at 2-5% error. Only architectures with input × input operations (x², attention) achieve high precision.
+
+### Multiplication Counts: 256×256 Novel View Synthesis
+
+| System | Total Muls | Input-Input Muls | Input-Input % | Overhead vs Graphics |
+|--------|-----------|-------------------|---------------|---------------------|
+| **Graphics (64 pts/ray)** | 190M | 110M | 57.6% | 1x |
+| ViT-Tiny | 910M | 152M | 16.7% | 4.8x |
+| ViT-Small | 6.2B | 609M | 9.8% | 32.7x |
+| ViT-Base | 23.3B | 1.2B | 5.2% | 122.6x |
+| ViT-Large | 81.3B | 3.2B | 4.0% | 426.8x |
+
+### The Efficiency Gap
+
+**Classical graphics** performs **targeted** multiplications — each has a specific geometric meaning:
+- `ray_dir × R` = world-space ray (9 muls per ray)
+- `point × K` = 2D projection (9 muls per point)
+- `alpha × transmittance × color` = rendered pixel (4 muls per sample)
+
+**Transformers** perform **generic** multiplications via attention — QK^T multiplies ALL pairs of token representations. Most are "wasted" — they compute relationships between patches with no geometric relevance. The network must learn which of the exponentially many possible multiplications to actually use.
+
+### Scaling Behavior
+
+- **Graphics**: O(H² × N) — linear in pixels, linear in samples per ray
+- **Transformer**: O(S² × d × L) where S = (H/P)² — **quartic** in resolution (quadratic in patch count, which is quadratic in resolution)
+
+At higher resolutions, the transformer overhead grows dramatically.
+
+### Implications
+
+1. **Transformers CAN replace graphics engines** — attention provides the multiplicative operations needed
+2. **But they are wildly inefficient** — 100-400x more multiplications than the classical pipeline, and only 4-17% are the "right kind" (input × input)
+3. **The x² result is the existence proof** — with the right inductive bias matching the target function's structure, we can be exponentially more efficient
+4. **Future direction**: Can we design architectures that have the transformer's generality but the graphics engine's multiplication efficiency? (e.g., geometric attention, structured state spaces with multiplicative gates)
+
+---
+
 ## How to Reproduce
 
 ```bash
@@ -110,4 +162,10 @@ CUDA_VISIBLE_DEVICES=0 python train.py --epochs 100
 
 # Plot results
 python plot_results.py --results-dir results --output-dir plots
+
+# Run multiplication counting analysis
+python analysis_multiplication_counting.py
+
+# Plot analysis figures
+python plot_analysis.py
 ```
