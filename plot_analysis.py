@@ -160,6 +160,155 @@ def main():
     plt.close()
     print("Saved multiplication_vs_precision.png")
 
+    # ============================================================
+    # Figure 4: Input-input ratio vs sequence length
+    # ============================================================
+    fig, axes = plt.subplots(1, 2, figsize=(16, 7))
+
+    # The ratio formula:
+    # Per layer:
+    #   attn input-input = 2 * S^2 * d_model  (QK^T + attn*V)
+    #   weight-input     = (2 * d_ff * d_model + 4 * d_model^2) * S  (FFN + QKV/output proj)
+    #   ratio = 2*S^2*d / (2*S^2*d + (2*d_ff*d + 4*d^2)*S)
+    #         = 2*S / (2*S + 2*d_ff + 4*d)
+    #         = S / (S + d_ff + 2*d)
+    # Crossover at S = d_ff + 2*d
+
+    seq_lens = np.arange(2, 4097)
+
+    configs = [
+        ('ViT-Tiny (d=192, d_ff=768)', 192, 768),
+        ('ViT-Small (d=384, d_ff=1536)', 384, 1536),
+        ('ViT-Base (d=768, d_ff=3072)', 768, 3072),
+        ('ViT-Large (d=1024, d_ff=4096)', 1024, 4096),
+    ]
+
+    colors_vit = ['#4daf4a', '#377eb8', '#e41a1c', '#984ea3']
+
+    for (name, d, dff), color in zip(configs, colors_vit):
+        ratio = seq_lens / (seq_lens + dff + 2 * d)
+        crossover = dff + 2 * d
+        axes[0].plot(seq_lens, ratio * 100, label=name, color=color, linewidth=2)
+        # Mark crossover
+        axes[0].axvline(x=crossover, color=color, linestyle=':', alpha=0.4)
+        axes[0].plot(crossover, 50, 'o', color=color, markersize=6)
+
+    # Mark typical ViT sequence lengths for different image resolutions (patch_size=16)
+    res_markers = [(64, 16), (128, 64), (256, 256), (512, 1024)]
+    for res, n_patches in res_markers:
+        axes[0].axvline(x=n_patches+1, color='gray', linestyle='--', alpha=0.3)
+        axes[0].text(n_patches+1, 2, f'{res}x{res}\n({n_patches} patches)',
+                     fontsize=8, ha='center', color='gray')
+
+    axes[0].axhline(y=50, color='black', linestyle=':', alpha=0.3)
+    axes[0].text(50, 52, '50% crossover', fontsize=9, color='gray')
+
+    axes[0].set_xlabel('Sequence Length (S)', fontsize=12)
+    axes[0].set_ylabel('Input-Input Multiplications (% of total)', fontsize=12)
+    axes[0].set_title('Input-Input Multiplication Ratio vs Sequence Length\n'
+                      '(depth-invariant — same ratio at any number of layers)', fontsize=12)
+    axes[0].set_xscale('log')
+    axes[0].legend(fontsize=9, loc='lower right')
+    axes[0].grid(True, alpha=0.3)
+    axes[0].set_ylim(0, 75)
+    axes[0].set_xlim(2, 5000)
+
+    # Right panel: absolute counts — attention vs FFN per layer
+    ax2 = axes[1]
+
+    d_model, d_ff = 768, 3072  # ViT-Base
+    seq_range = np.arange(2, 4097)
+
+    attn_per_layer = 2 * seq_range**2 * d_model
+    ffn_per_layer = (2 * d_ff * d_model + 4 * d_model**2) * seq_range
+
+    ax2.plot(seq_range, attn_per_layer, color='#e41a1c', linewidth=2,
+             label='Attention (input×input)\n$2S^2 d_{model}$')
+    ax2.plot(seq_range, ffn_per_layer, color='#377eb8', linewidth=2,
+             label='FFN + Projections (weight×input)\n$(2d_{ff}d + 4d^2) \\cdot S$')
+
+    crossover = d_ff + 2 * d_model
+    ax2.axvline(x=crossover, color='gray', linestyle=':', alpha=0.5)
+    ax2.text(crossover * 1.1, 1e9, f'Crossover\nS={crossover}', fontsize=9, color='gray')
+
+    # Fill regions
+    ax2.fill_between(seq_range, attn_per_layer, ffn_per_layer,
+                     where=attn_per_layer < ffn_per_layer,
+                     alpha=0.1, color='#377eb8', label='_')
+    ax2.fill_between(seq_range, attn_per_layer, ffn_per_layer,
+                     where=attn_per_layer >= ffn_per_layer,
+                     alpha=0.1, color='#e41a1c', label='_')
+
+    ax2.set_xscale('log')
+    ax2.set_yscale('log')
+    ax2.set_xlabel('Sequence Length (S)', fontsize=12)
+    ax2.set_ylabel('Multiplications per Layer', fontsize=12)
+    ax2.set_title('ViT-Base: Attention vs FFN Multiplications\n'
+                  '(attention is O(S²), FFN is O(S) — attention dominates at long sequences)',
+                  fontsize=11)
+    ax2.legend(fontsize=10)
+    ax2.grid(True, alpha=0.3)
+
+    plt.tight_layout()
+    plt.savefig('plots/ratio_vs_seqlen.png', dpi=150, bbox_inches='tight')
+    plt.close()
+    print("Saved ratio_vs_seqlen.png")
+
+    # ============================================================
+    # Figure 5: Structural alignment — capacity vs utilization
+    # ============================================================
+    fig, ax = plt.subplots(figsize=(12, 7))
+
+    # For 256x256 NVS, compare absolute input-input mul counts
+    graphics_ii = 109_641_728  # from our analysis
+
+    vit_configs_data = [
+        ('ViT-Tiny\n(S=257)', 152_176_896),
+        ('ViT-Small\n(S=257)', 608_707_584),
+        ('ViT-Base\n(S=257)', 1_217_415_168),
+        ('ViT-Large\n(S=257)', 3_246_440_448),
+    ]
+
+    labels = ['Graphics\n(targeted)'] + [c[0] for c in vit_configs_data]
+    ii_counts = [graphics_ii] + [c[1] for c in vit_configs_data]
+    overheads = [c / graphics_ii for c in ii_counts]
+
+    bar_colors = ['#ff7f00'] + ['#377eb8'] * 4
+    bars = ax.bar(range(len(labels)), ii_counts, color=bar_colors, alpha=0.8, edgecolor='black', linewidth=0.5)
+
+    # Graphics needed line
+    ax.axhline(y=graphics_ii, color='#ff7f00', linestyle='--', linewidth=2, alpha=0.7,
+               label=f'Graphics needs: {graphics_ii/1e6:.0f}M muls')
+
+    # Annotations
+    for i, (bar, oh) in enumerate(zip(bars, overheads)):
+        if i == 0:
+            ax.text(bar.get_x() + bar.get_width()/2, bar.get_height() * 1.05,
+                    '100% utilized\n(every mul has\ngeometric meaning)',
+                    ha='center', fontsize=9, fontweight='bold', color='#ff7f00')
+        else:
+            waste_pct = (1 - 1/oh) * 100
+            ax.text(bar.get_x() + bar.get_width()/2, bar.get_height() * 1.05,
+                    f'{oh:.1f}x capacity\n~{waste_pct:.0f}% structurally\nmisaligned',
+                    ha='center', fontsize=9, color='#377eb8')
+
+    ax.set_ylabel('Input-Input Multiplications', fontsize=12)
+    ax.set_title('Multiplicative Capacity vs Structural Need\n'
+                 'Transformers have ENOUGH multiplications — but most are in the wrong place',
+                 fontsize=13)
+    ax.set_xticks(range(len(labels)))
+    ax.set_xticklabels(labels, fontsize=10)
+    ax.legend(fontsize=11, loc='upper left')
+    ax.grid(True, alpha=0.3, axis='y')
+
+    # Formatting
+    ax.yaxis.set_major_formatter(plt.FuncFormatter(lambda x, _: f'{x/1e9:.1f}B' if x >= 1e9 else f'{x/1e6:.0f}M'))
+
+    plt.tight_layout()
+    plt.savefig('plots/capacity_vs_utilization.png', dpi=150, bbox_inches='tight')
+    plt.close()
+    print("Saved capacity_vs_utilization.png")
+
 
 if __name__ == '__main__':
     main()
