@@ -154,6 +154,33 @@ At higher resolutions, the transformer overhead grows dramatically.
 
 ---
 
+## Part 3: SVSM Ablation — Testing Multiplicative Variants on Real NVS
+
+We apply our multiplication density insights to **SVSM** (Scalable View Synthesis Model, CVPR 2026), a state-of-the-art transformer for novel view synthesis on RealEstate10K.
+
+### Architecture Modifications
+
+Base SVSM: encoder (4 layers) + decoder (4 layers) with cross-attention, d=256, d_head=64, mlp_ratio=4, GELU activation.
+
+| Variant | FFN Change | Input-Input Mul Density | Hypothesis |
+|---------|-----------|------------------------|------------|
+| **baseline** | GELU FFN | ~25% (attention only) | Control |
+| **swiglu** | SwiGLU gating: `L₁(x) * SiLU(L₂(x))` | ~40% (attention + FFN gate) | Gating adds input×input muls in FFN |
+| **bilinear** | Pure bilinear: `L₁(x) * L₂(x)` | ~40% (attention + FFN gate) | Maximum FFN multiplicative capacity |
+| **square** | x² activation | ~25% (but exact mul capacity) | From our toy experiment: perfect for multiplication |
+| **square_plus_linear** | αx² + βx (learnable) | ~25% (but partial mul capacity) | Multiplication + gradient stability |
+| **low_ffn** | mlp_ratio=1, 8 layers (2x depth) | ~50% (more attention per FLOP) | Shift compute budget toward attention |
+
+### Key Question
+
+Does increasing multiplication density in the FFN improve novel view synthesis quality at the same compute budget? If so, it validates our theoretical analysis: transformers for graphics need more input×input operations, and the standard FFN wastes compute on weight×input operations that can't perform the geometric multiplications needed.
+
+### Code
+
+Modifications in `/ccn2/u/wanhee/SVSM/model/layers/multiplicative_variants.py` and configs in `/ccn2/u/wanhee/SVSM/configs/ablation_*.yaml`.
+
+---
+
 ## How to Reproduce
 
 ```bash
